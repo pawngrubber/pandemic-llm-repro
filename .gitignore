@@ -1,1 +1,1 @@
-data/\nmodels/\n*.pkl\n*.zip\n.venv/\n__pycache__/
+outputs/\noutputs_ordinal/\nunsloth_compiled_cache/\n*.log\n*.pkl\ndata/\nmodels/\n.venv/\n__pycache__/
