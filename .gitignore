@@ -4,6 +4,7 @@ curated_data/
 *.pkl
 *.zip
 *.jsonl
+*.csv
 
 # Models and Training Outputs
 outputs*/
