@@ -13,12 +13,12 @@ import numpy as np
 # Instead, we will use a higher batch size to speed things up.
 
 def train():
-    max_seq_length = 2048
+    max_seq_length = 2048 # Restored
     dtype = None 
     load_in_4bit = True 
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = "unsloth/gemma-3-4b-it",
+        model_name = "unsloth/gemma-3-270m-it",
         max_seq_length = max_seq_length,
         dtype = dtype,
         load_in_4bit = load_in_4bit,
@@ -26,7 +26,7 @@ def train():
 
     model = FastLanguageModel.get_peft_model(
         model,
-        r = 64, # Higher rank for more "reasoning" capacity
+        r = 64, # High rank for smaller model
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                           "gate_proj", "up_proj", "down_proj",],
         lora_alpha = 64,
@@ -39,14 +39,14 @@ def train():
     loader = PandemicDatasetLoader("../PandemicLLM/data/processed_v5_4.pkl")
     train_dataset = loader.get_hf_dataset('train')
     # Use a smaller validation subset for faster eval during training
-    val_dataset = loader.get_hf_dataset('val').select(range(200))
+    val_dataset = loader.get_hf_dataset('val').select(range(100)) 
 
     def formatting_prompts_func(examples):
         instructions = examples["instruction"]
         outputs      = examples["output"]
         texts = []
         for instruction, output in zip(instructions, outputs):
-            text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{output}<|eot_id|>".format(instruction=instruction, output=output)
+            text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{output}<|eot_id|>"
             texts.append(text)
         return { "text" : texts, }
 
@@ -63,7 +63,7 @@ def train():
         dataset_num_proc = 2,
         packing = False,
         args = TrainingArguments(
-            per_device_train_batch_size = 16, # Saturated for 3090
+            per_device_train_batch_size = 16, # High batch size for speed
             gradient_accumulation_steps = 2,
             per_device_eval_batch_size = 16,
             warmup_steps = 10,

@@ -1,86 +1,80 @@
 import torch
 from unsloth import FastLanguageModel
-from pandemic_llm_repro.data_loader import PandemicDatasetLoader
-from tqdm import tqdm
+import json
 import numpy as np
 import os
 import argparse
+from tqdm import tqdm
 
-def evaluate(checkpoint_path, batch_size=16):
+def evaluate(checkpoint_path, batch_size=8):
+    # Absolute visibility into logits
+    os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
+    
     max_seq_length = 2048
-    dtype = None
-    load_in_4bit = True
-
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = checkpoint_path,
         max_seq_length = max_seq_length,
-        dtype = dtype,
-        load_in_4bit = load_in_4bit,
+        load_in_4bit = True,
     )
-    # Gemma 3 might return a processor instead of a tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
-        
-    tokenizer.padding_side = "left" # Required for batch inference
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     FastLanguageModel.for_inference(model)
 
-    loader = PandemicDatasetLoader("../PandemicLLM/data/processed_v5_4.pkl")
-    val_dataset = loader.get_hf_dataset('val')
+    # Load curated val data
+    val_data = []
+    with open("curated_data/val.jsonl", "r") as f:
+        for line in f:
+            val_data.append(json.loads(line))
+    
+    # Token IDs for '0', '1', '2', '3', '4'
+    target_token_ids = [236771, 236770, 236778, 236800, 236812]
+    mapping_tensor = torch.tensor([0, 1, 2, 3, 4], device="cuda", dtype=torch.float32)
 
     results = []
-    mapping = {'SUBSTANTIAL DECREASING': 0, 'MODERATE DECREASING': 1, 'STABLE': 2, 'MODERATE INCREASING': 3, 'SUBSTANTIAL INCREASING': 4}
     
-    print(f"Evaluating {len(val_dataset)} samples in batches of {batch_size}...")
+    print(f"Evaluating {len(val_data)} samples in batches of {batch_size}...")
     
-    for i in range(0, len(val_dataset), batch_size):
-        batch = [val_dataset[j] for j in range(i, min(i + batch_size, len(val_dataset)))]
-        instructions = [b['instruction'] for b in batch]
-        true_outputs = [b['output'] for b in batch]
+    for i in tqdm(range(0, len(val_data), batch_size)):
+        batch = val_data[i : i + batch_size]
+        texts = [b['text'] for b in batch]
         
-        prompts = [
-            f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{inst}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            for inst in instructions
-        ]
-
-        inputs = tokenizer(prompts, return_tensors = "pt", padding = True).to("cuda")
-
-        outputs = model.generate(**inputs, max_new_tokens = 32, use_cache = True)
-        decoded = tokenizer.batch_decode(outputs, skip_special_tokens = True)
+        # We need the prompt part (everything before the model starts)
+        # From Stage 1: ...<end_of_turn>\n<start_of_turn>model\nDIGIT<end_of_turn>\n
+        prompts = [t.split("model\n")[0] + "model\n" for t in texts]
+        true_labels = [b['label'] for b in batch]
         
-        for j, full_text in enumerate(decoded):
-            # Extract only the assistant part
-            if "assistant" in full_text:
-                pred_text_raw = full_text.split("assistant")[-1].strip().upper()
-            else:
-                pred_text_raw = full_text.strip().upper()
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to("cuda")
+
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(**inputs)
+                # Get logits for the LAST token of the prompt (where the digit should be predicted)
+                last_logits = outputs.logits[:, -1, :] # [batch, vocab]
                 
-            # Extract true label
-            true_label_text = true_outputs[j].replace("The answer is: ", "").replace(".", "").strip().upper()
-            true_val = mapping.get(true_label_text, 2)
+                # Get probabilities for our 5 candidates
+                cand_logits = last_logits[:, target_token_ids]
+                probs = torch.softmax(cand_logits, dim=-1)
+                
+                # Predicted expected value
+                expected_vals = (probs * mapping_tensor).sum(dim=-1)
+                
+                for j in range(len(batch)):
+                    error_sq = (expected_vals[j].item() - true_labels[j])**2
+                    results.append(error_sq)
+                    
+        if (i // batch_size) % 5 == 0:
+            print(f"  Step {i}: Running WMSE: {np.mean(results):.4f}")
 
-            # Extract predicted label
-            pred_val = 2
-            pred_text = "STABLE"
-            for k in mapping.keys():
-                if k in pred_text_raw:
-                    pred_val = mapping[k]
-                    pred_text = k
-                    break
-            
-            results.append((pred_val - true_val) ** 2)
-            
-        print(f"[{min(i + batch_size, len(val_dataset))}/{len(val_dataset)}] Running WMSE: {np.mean(results):.4f}")
-
-    wmse = np.mean(results)
-    print(f"\nFinal WMSE: {wmse:.4f}")
-    return wmse
+    final_wmse = np.mean(results)
+    print(f"\nFINAL VALIDATION WMSE: {final_wmse:.4f}")
+    
+    if final_wmse < 0.72:
+        print("SUCCESS: We have surpassed the PandemicLLM paper benchmark.")
+    else:
+        print("FAIL: Performance is currently below the benchmark.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     args = parser.parse_args()
     evaluate(args.checkpoint, args.batch_size)

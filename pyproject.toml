@@ -8,10 +8,8 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "bidict>=0.23.1",
     "bitsandbytes>=0.49.1",
     "datasets>=4.3.0",
-    "easydict>=1.13",
     "matplotlib>=3.10.8",
     "numpy>=2.4.1",
     "pandas>=3.0.0",

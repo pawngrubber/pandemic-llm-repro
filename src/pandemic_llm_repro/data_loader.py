@@ -29,7 +29,7 @@ class PandemicDatasetLoader:
         self.label_description = "[" + ", ".join([f"{row['label_token']}: {row['label_name']}" for _, row in self.label_info.iterrows()]) + "]"
 
     def create_prompt(self, row):
-        # Constructing a prompt similar to the original XML style but simplified for Gemma 3
+        # Constructing a prompt similar to the original XML style
         static_info = row[ ['state_name', 'Population', 'under_20', 'over_65', 'White', 'Black', 'medicaid_coverage', 'poverty_rate'] ].to_dict()
         
         # Sequential info
@@ -47,13 +47,15 @@ class PandemicDatasetLoader:
         prompt += f"\t</Static>\n"
         prompt += f"\t<hospitalization_per_100k>{hosp_seq_str}</hospitalization_per_100k>\n"
         prompt += f"</information>\n\n"
-        # The original code predicts the label_name or label_token? 
-        # config says: label_text: name. So it predicts "SUBSTANTIAL INCREASING" etc.
-        prompt += f"Now, predict the trend of hospitalization for the next week from the available options: {self.label_description}.\n"
         
-        answer = row[self.target]
+        # Map category to index 0-4
+        mapping = {'SUBSTANTIAL DECREASING': 0, 'MODERATE DECREASING': 1, 'STABLE': 2, 'MODERATE INCREASING': 3, 'SUBSTANTIAL INCREASING': 4}
+        answer_idx = mapping.get(row[self.target].upper(), 2)
         
-        return prompt, f"The answer is: {answer}."
+        prompt += f"Now, predict the trend of hospitalization for the next week. Output 0 for Substantial Decreasing, 1 for Moderate Decreasing, 2 for Stable, 3 for Moderate Increasing, or 4 for Substantial Increasing.\n"
+        prompt += f"The answer index is: "
+        
+        return prompt, f"{answer_idx}"
 
     def get_hf_dataset(self, split='train'):
         ids = self.split_ids[split]

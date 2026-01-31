@@ -1,1 +1,23 @@
-outputs/\noutputs_ordinal/\nunsloth_compiled_cache/\n*.log\n*.pkl\ndata/\nmodels/\n.venv/\n__pycache__/
+# Data artifacts
+data/
+curated_data/
+*.pkl
+*.zip
+*.jsonl
+
+# Models and Training Outputs
+outputs*/
+unsloth_compiled_cache/
+models/
+
+# Environment and Logs
+.venv/
+__pycache__/
+*.log
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# OS specific
+.DS_Store
