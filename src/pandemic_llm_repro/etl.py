@@ -7,11 +7,35 @@ from datetime import datetime, timedelta
 import sys
 from scipy.interpolate import interp1d
 
-# STAGE 1: ABSOLUTE PARITY ETL
-# - Unit Scaling (ED Visits -> Case Equivalent)
-# - Biological Vector Mapping (Transmission, Immunity, Severity)
-# - Dual-Track Smoothing (Raw + _sm)
-# - Daily Temporal Joins
+# ==============================================================================
+# FINAL PRODUCTION ETL (REAL-WORLD IMPUTATION)
+# - Anchor on Hospitalization (2023-2026)
+# - State-Region Mapping for Variants
+# - Forward-Fill Vax Plateaus (Post-May 2023)
+# ==============================================================================
+
+BIO_PROFILES = {
+    'JN':  [0.90, 0.85, 0.35],
+    'KP':  [0.94, 0.90, 0.35],
+    'LB':  [0.95, 0.92, 0.35],
+    'XEC': [0.96, 0.94, 0.35],
+    'MC':  [0.90, 0.85, 0.35],
+    'XBB': [0.85, 0.80, 0.40],
+    'BA':  [0.85, 0.80, 0.40]
+}
+
+STATE_TO_REGION = {
+    'CT': 1, 'ME': 1, 'MA': 1, 'NH': 1, 'RI': 1, 'VT': 1,
+    'NJ': 2, 'NY': 2, 'PR': 2, 'VI': 2,
+    'DE': 3, 'DC': 3, 'MD': 3, 'PA': 3, 'VA': 3, 'WV': 3,
+    'AL': 4, 'FL': 4, 'GA': 4, 'KY': 4, 'MS': 4, 'NC': 4, 'SC': 4, 'TN': 4,
+    'IL': 5, 'IN': 5, 'MI': 5, 'MN': 5, 'OH': 5, 'WI': 5,
+    'AR': 6, 'LA': 6, 'NM': 6, 'OK': 6, 'TX': 6,
+    'IA': 7, 'KS': 7, 'MO': 7, 'NE': 7,
+    'CO': 8, 'MT': 8, 'ND': 8, 'SD': 8, 'UT': 8, 'WY': 8,
+    'AZ': 9, 'CA': 9, 'HI': 9, 'NV': 9, 'AS': 9, 'GU': 9, 'MP': 9,
+    'AK': 10, 'ID': 10, 'OR': 10, 'WA': 10
+}
 
 CODE_TO_NAME = {
     'AL': 'Alabama', 'AK': 'Alaska', 'AZ': 'Arizona', 'AR': 'Arkansas', 'CA': 'California',
@@ -26,102 +50,110 @@ CODE_TO_NAME = {
     'VA': 'Virginia', 'WA': 'Washington', 'WV': 'West Virginia', 'WI': 'Wisconsin', 'WY': 'Wyoming'
 }
 
-# BIOLOGICAL VECTOR TABLE (Transmission, Immunity Escape, Severity)
-# Estimated for 2024-2026 dominant strains
-VARIANT_PROFILES = {
-    'JN.1': [0.9, 0.85, 0.35],
-    'KP.2': [0.92, 0.9, 0.35],
-    'KP.3': [0.94, 0.92, 0.35],
-    'XEC':  [0.96, 0.94, 0.35],
-    'BASE': [0.85, 0.80, 0.40]
-}
+def fetch_cdc_stream(url_id, date_col='date', filter_col=None, filter_val=None):
+    url = f"https://data.cdc.gov/resource/{url_id}.json?$limit=50000"
+    if filter_col: url += f"&{filter_col}={filter_val}"
+    try:
+        df = pd.DataFrame(requests.get(url, timeout=60).json())
+        if df.empty: return pd.DataFrame()
+        df['dt_index'] = pd.to_datetime(df[date_col])
+        return df.set_index('dt_index').sort_index()
+    except: return pd.DataFrame()
 
-def load_fat_static_features():
+def run_production_etl(output_dir="/home/paul/Documents/code/pandemic_ml_data"):
+    print("::: INITIALIZING REAL-WORLD IMPUTATION ETL :::")
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, "ml_dataset_production_gold.jsonl")
+    
+    # 1. LOAD STATIC DATA
     legacy_path = 'curated_data/stage1_train.jsonl'
-    state_map = {}
+    static_map = {}
     with open(legacy_path) as f:
         for line in f:
             d = json.loads(line)
-            state_map[d['state'].lower()] = d['static']
-    return state_map
+            static_map[d['state'].lower()] = d['static']
 
-def fetch_socrata(dataset_id, where_clause):
-    url = f"https://data.cdc.gov/resource/{dataset_id}.json?{where_clause}"
-    try:
-        r = requests.get(url, timeout=30)
-        return pd.DataFrame(r.json())
-    except: return pd.DataFrame()
-
-def run_absolute_parity_etl(output_dir="/home/paul/Documents/code/pandemic_ml_data"):
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, "ml_dataset_absolute_parity.jsonl")
-    
-    static_features = load_fat_static_features()
-    
-    print("ETL: Fetching Hospitalizations...")
+    # 2. FETCH REAL-TIME DATA
+    print(" >> Streaming Hospitalizations...")
     h_url = f"https://api.delphi.cmu.edu/epidata/covidcast/?data_source=nhsn&signals=confirmed_admissions_covid_ew&time_type=week&geo_type=state&time_values=202301-202605&geo_value=*"
-    df_hosp = pd.DataFrame(requests.get(h_url).json()['epidata'])
+    df_hosp_raw = pd.DataFrame(requests.get(h_url).json()['epidata'])
     
-    print("ETL: Fetching ED Leads, Vax, and Variant Proportions...")
-    df_ed = fetch_socrata("7mra-9cq9", "$limit=50000")
-    df_vax = fetch_socrata("unsk-b7fc", "$limit=50000")
-    df_var = fetch_socrata("jr58-6ysp", "$limit=10000")
+    print(" >> Streaming Vaccination Plateaus (Legacy May 2023)...")
+    df_vax_raw = fetch_cdc_stream('unsk-b7fc', date_col='date')
+    
+    print(" >> Streaming Variants (Regional Mapping)...")
+    df_var_raw = fetch_cdc_stream('jr58-6ysp', date_col='week_ending')
 
+    print(" >> Building Unified Daily Timelines...")
     all_samples = []
-    print("ETL: Performing Daily Temporal Joins with Multi-Signal Smoothing...")
 
-    for state_code, group in df_hosp.groupby('geo_value'):
+    for state_code, group in df_hosp_raw.groupby('geo_value'):
         state_name = CODE_TO_NAME.get(state_code.upper(), "").lower()
-        if state_name not in static_features: continue
-        static = static_features[state_name]
+        if state_name not in static_map: continue
+        static = static_map[state_name]
         
+        # Smoothing
         group = group.sort_values('time_value')
-        group['rate'] = (group['value'] / static['Population']) * 100000
+        hosp_weekly = (group['value'] / static['Population'] * 100000).tolist()
+        if len(hosp_weekly) < 10: continue
         
-        # Linear Daily Smoothing
-        raw_weekly = group['rate'].tolist()
-        if len(raw_weekly) < 6: continue
-        daily_rates = interp1d(np.arange(len(raw_weekly)), raw_weekly, kind='linear')(np.linspace(0, len(raw_weekly)-1, len(raw_weekly)*7))
+        daily_hosp = interp1d(np.arange(len(hosp_weekly)), hosp_weekly, kind='linear')(np.linspace(0, len(hosp_weekly)-1, len(hosp_weekly)*7))
+        daily_hosp = np.clip(daily_hosp + np.random.normal(0, 0.05 * np.mean(daily_hosp), len(daily_hosp)), 0, None)
         
-        # Generate _sm (smoothed) version (7-day rolling mean)
-        # Note: In our interpolated data, we add a tiny bit of jitter first to avoid perfect lines
-        daily_rates_jitter = np.clip(daily_rates + np.random.normal(0, 0.02, len(daily_rates)), 0, None)
-        daily_rates_sm = pd.Series(daily_rates_jitter).rolling(7, min_periods=1).mean().tolist()
+        # Reindexing
+        idx_range = pd.date_range(start='2023-01-01', periods=len(daily_hosp), freq='D')
+        
+        # Variant Context per Region
+        region = STATE_TO_REGION.get(state_code.upper(), 1)
+        s_var = df_var_raw[df_var_raw['usa_or_hhsregion'] == str(region)]
+        if s_var.empty: s_var = df_var_raw[df_var_raw['usa_or_hhsregion'] == 'USA']
+        
+        # Deduplicate and Reindex
+        s_var = s_var[~s_var.index.duplicated(keep='first')]
+        s_var_daily = s_var.reindex(idx_range, method='ffill')
+        
+        # Vax Context (Last Known May 2023 Value)
+        s_vax = df_vax_raw[df_vax_raw['location'] == state_code.upper()]
+        last_vax = s_vax.iloc[-1] if not s_vax.empty else None
 
-        # State contexts
-        s_ed = df_ed[df_ed['geography'] == state_code.upper()].copy()
-        s_vax = df_vax[df_vax['location'] == state_code.upper()].copy()
-        s_var = df_var[df_var['usa_or_hhsregion'] == 'USA'].copy() # National variant proxy
-
-        for i in range(28, len(daily_rates) - 7):
-            curr_date = datetime(2023, 1, 1) + timedelta(days=i)
+        for i in range(28, len(daily_hosp) - 7):
+            curr_date = idx_range[i]
+            hosp_hist, v_d1, v_sc, v_ad, bio_trans, bio_esc, bio_sev = [], [], [], [], [], [], []
             
-            # 1. Hospitalization & Smoothed History
-            history_raw = daily_rates_jitter[i-28:i]
-            history_sm = daily_rates_sm[i-28:i]
-            hosp_list = [round(np.mean(history_raw[j:j+7]), 2) for j in range(0, 28, 7)]
-            hosp_sm_list = [round(np.mean(history_sm[j:j+7]), 2) for j in range(0, 28, 7)]
+            valid = True
+            for offset in range(21, -1, -7):
+                lb_date = idx_range[i-offset]
+                hosp_hist.append(round(daily_hosp[i-offset], 2))
+                
+                # Vaccination (Plateau Imputation)
+                if last_vax is not None:
+                    v_d1.append(float(last_vax['administered_dose1_pop_pct']))
+                    v_sc.append(float(last_vax['series_complete_pop_pct']))
+                    v_ad.append(float(last_vax.get('additional_doses_vax_pct', 35.0)))
+                else:
+                    v_d1.append(75.0); v_sc.append(70.0); v_ad.append(35.0)
+                
+                # Biological Profile
+                try:
+                    var_name = str(s_var_daily.loc[lb_date]['variant'])
+                    clean_name = var_name.upper()
+                    profile = None
+                    for prefix, p in BIO_PROFILES.items():
+                        if clean_name.startswith(prefix): profile = p; break
+                    if not profile: profile = BIO_PROFILES['JN']
+                    
+                    bio_trans.append(profile[0])
+                    bio_esc.append(profile[1])
+                    bio_sev.append(profile[2])
+                except:
+                    valid = False; break
             
-            # 2. Case Proxy (ED Scaling: 1% visits approx 150 cases/100k in legacy scale)
-            ed_rec = s_ed.iloc[min(i//7, len(s_ed)-1)] if not s_ed.empty else {}
-            ed_val = float(ed_rec.get('percent_visits', 0.0)) * 150.0 
-            cases_list = [round(ed_val, 2)] * 4 # Simulated history based on current lead
-            
-            # 3. Triple Vax Shield
-            v_rec = s_vax.iloc[min(i//7, len(s_vax)-1)] if not s_vax.empty else {}
-            v_d1 = [float(v_rec.get('administered_dose1_pop_pct', 75.0))] * 4
-            v_sc = [float(v_rec.get('series_complete_pop_pct', 70.0))] * 4
-            v_ad = [float(v_rec.get('additional_doses_vax_pct', 35.0))] * 4
-
-            # 4. Biological Vector
-            var_rec = s_var.iloc[min(i//7, len(s_var)-1)] if not s_var.empty else {}
-            var_name = var_rec.get('variant', 'BASE')
-            bio_vector = VARIANT_PROFILES.get(var_name, VARIANT_PROFILES['BASE'])
+            if not valid: continue
 
             # Labeling
-            target_val = np.mean(daily_rates[i:i+7])
-            sigma = max(np.std(hosp_list), 0.15)
-            diff = target_val - hosp_list[-1]
+            target = np.mean(daily_hosp[i:i+7])
+            sigma = max(np.std(hosp_hist), 0.15)
+            diff = target - hosp_hist[-1]
             if abs(diff) < 0.1: label = 2
             elif diff > 2.0 * sigma: label = 4
             elif diff > 1.0 * sigma: label = 3
@@ -132,25 +164,22 @@ def run_absolute_parity_etl(output_dir="/home/paul/Documents/code/pandemic_ml_da
             all_samples.append({
                 "state": state_name.title(),
                 "date": curr_date.strftime("%Y-%m-%d"),
-                "hospitalization_per_100k": hosp_list,
-                "hospitalization_per_100k_sm": hosp_sm_list,
-                "reported_cases_per_100k": cases_list,
+                "hospitalization_per_100k": hosp_hist,
+                "reported_cases_per_100k": [round(h*1.5, 2) for h in hosp_hist], # Synthetic Lead proxy for 2025
                 "Dose1_Pop_Pct": v_d1,
                 "Series_Complete_Pop_Pct": v_sc,
                 "Additional_Doses_Vax_Pct": v_ad,
-                "transmission": [bio_vector[0]] * 4,
-                "immunity": [bio_vector[1]] * 4,
-                "severity": [bio_vector[2]] * 4,
+                "transmission": bio_trans,
+                "immunity": bio_esc,
+                "severity": bio_sev,
                 "label": label,
                 "static": static
             })
 
-    with open(out_path, "w") as f:
-        for s in all_samples:
-            f.write(json.dumps(s) + "\n")
+    with open(out_path, "w") as f: 
+        for s in all_samples: f.write(json.dumps(s) + "\n")
 
-    print(f"ABSOLUTE PARITY SUCCESS: Generated {len(all_samples)} samples.")
-    return out_path
+    print(f"::: REPRODUCTION SUCCESS :::\n    Samples: {len(all_samples)}\n    File: {out_path}")
 
 if __name__ == "__main__":
-    run_absolute_parity_etl()
+    run_production_etl()
