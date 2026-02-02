@@ -2,6 +2,7 @@
 # dependencies = [
 #   "requests",
 #   "pandas",
+#   "numpy",
 # ]
 # ///
 
@@ -9,10 +10,11 @@ import requests
 import pandas as pd
 import json
 import os
-from datetime import datetime
+import numpy as np
 
 # Stage 3: Real-Time Data Ingestion (Modern Delphi API)
-# Fetches NHSN weekly hospitalization data through 2025 and early 2026.
+# Uses Standard Deviation (sigma) for categorical thresholding to match
+# the original paper's statistical rigor in a lower-signal era.
 
 STATE_POPULATIONS = {
     'al': 5024279, 'ak': 733391, 'az': 7151502, 'ar': 3011524, 'ca': 39538223,
@@ -28,62 +30,61 @@ STATE_POPULATIONS = {
 }
 
 def fetch_delphi_data():
-    print("STAGE 3: Fetching 2025-2026 weekly hospitalization data from Delphi Epidata API...")
+    print("STAGE 3: Fetching 2025-2026 data and applying Sigma-Thresholding...")
     
-    # We'll pull data for all states for 2025 and early 2026
     states = ",".join(STATE_POPULATIONS.keys())
-    # Format: YYYYWW. 202501 to 202605
     time_range = "202501-202605"
-    
     url = f"https://api.delphi.cmu.edu/epidata/covidcast/?data_source=nhsn&signals=confirmed_admissions_covid_ew&time_type=week&geo_type=state&time_values={time_range}&geo_value={states}"
     
     response = requests.get(url)
-    if response.status_code != 200:
-        print(f"Error: {response.status_code}")
-        return
+    if response.status_code != 200: return
     
-    data = response.json().get('epidata', [])
-    if not data:
-        print("No data returned from Delphi API.")
-        return
-    
-    df = pd.DataFrame(data)
-    print(f"  - Downloaded {len(df)} weekly state records.")
-    
+    df = pd.DataFrame(response.json().get('epidata', []))
     modern_samples = []
+    
+    # Calculate global sigma for hospitalization changes in 2025 to normalize the threshold
+    df['rate'] = df.apply(lambda x: (x['value'] / STATE_POPULATIONS[x['geo_value']]) * 100000, axis=1)
+    
+    # We'll use a rolling window sigma to handle local volatility per state
     for state, group in df.groupby('geo_value'):
         group = group.sort_values('time_value')
-        
-        pop = STATE_POPULATIONS[state]
-        # Convert absolute admissions to rate per 100k
-        group['rate'] = (group['value'] / pop) * 100000
-        
         rates = group['rate'].tolist()
         times = group['time_value'].tolist()
         
-        # We need 4 weeks of history + 1 week target
+        # Calculate the historical standard deviation of weekly changes
+        # This allows the model to differentiate between "normal noise" and "real shifts"
+        deltas = np.diff(rates)
+        state_sigma = np.std(deltas) if len(deltas) > 0 else 0.5
+        
+        # Floor the sigma at 0.2 to prevent tiny fluctuations from being labeled as "Substantial"
+        state_sigma = max(state_sigma, 0.2)
+
         for i in range(4, len(rates)):
             history = rates[i-4:i]
             target_val = rates[i]
+            diff = target_val - history[-1] # Change from current week
             
-            # Labeling logic matching paper math
-            baseline = sum(history) / 4
-            diff = target_val - baseline
+            # Sigma-based labels:
+            # > 2.0 sigma = Substantial Increase (4)
+            # > 1.0 sigma = Moderate Increase (3)
+            # < -2.0 sigma = Substantial Decrease (0)
+            # < -1.0 sigma = Moderate Decrease (1)
+            # Else = Stable (2)
             
-            # Mapping diff to ordinal classes (Simplified thresholds)
-            if diff < -0.5: label = 0
-            elif diff < -0.1: label = 1
-            elif diff < 0.1: label = 2
-            elif diff < 0.5: label = 3
-            else: label = 4
+            if diff > 2.0 * state_sigma: label = 4
+            elif diff > 1.0 * state_sigma: label = 3
+            elif diff < -2.0 * state_sigma: label = 0
+            elif diff < -1.0 * state_sigma: label = 1
+            else: label = 2
             
             sample = {
                 "state": state.upper(),
                 "week_start": str(times[i]),
                 "history": [round(x, 2) for x in history],
                 "static": {
-                    "Population": pop,
-                    "state_name": state.upper()
+                    "Population": STATE_POPULATIONS[state],
+                    "state_name": state.upper(),
+                    "sigma_threshold": round(state_sigma, 4)
                 },
                 "label": label
             }
@@ -94,7 +95,7 @@ def fetch_delphi_data():
         for s in modern_samples:
             f.write(json.dumps(s) + "\n")
             
-    print(f"STAGE 3 COMPLETE: Generated {len(modern_samples)} modern samples (2025-2026).")
+    print(f"STAGE 3 COMPLETE: Generated {len(modern_samples)} samples with Sigma Calibration.")
 
 if __name__ == "__main__":
     fetch_delphi_data()
